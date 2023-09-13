@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+import hashlib
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from pydub import AudioSegment
@@ -11,6 +12,54 @@ import openai
 import json
 import uuid
 import os
+
+import numpy as np
+import faiss
+
+def insert_embeddings_to_faiss_db(embeddings, run_id):
+    dimension = len(next(iter(embeddings.values())))  # get the dimension size from the first embedding vector
+    db_file_path = f"faiss_db.index"  # define the path to save the faiss database
+
+    if os.path.exists(db_file_path):  # if the database file exists
+        db = faiss.read_index(db_file_path)  # load the database from the file
+    else:
+        db = faiss.IndexIDMap(faiss.IndexFlatL2(dimension))  # create a new faiss database with L2 distance metric
+
+    for speaker, embedding in embeddings.items():
+        embedding_np = np.asarray(embedding).astype('float32')  # convert the embedding to numpy array
+        embedding_np = np.expand_dims(embedding_np, axis=0)  # add an extra dimension for faiss
+
+        # Create a unique ID for each speaker using the run_id and speaker label
+        # TODO: Can we use ascii > int for this?
+        speaker_id = int(hashlib.sha1(f"{run_id}_{speaker}".encode()).hexdigest(), 16) % (10 ** 8)
+
+        if db.ntotal > 0:  # if the database is not empty
+            # compute the cosine distance between the new embedding and all existing embeddings in the database
+            distances, _ = db.search(embedding_np, db.ntotal) # TODO: Do we need all of these?
+            
+            logging.info(f"{speaker} min distance: {np.min(distances)}")
+
+            if np.min(distances) < 0.01:  # if the minimum distance is less than 0.01, the speaker already exists
+                logging.info(f"Speaker {speaker} already exists in the database.")
+                continue
+            else:
+                logging.info(f"Speaker {speaker} is new. Adding to the database.")
+
+        db.add_with_ids(embedding_np, np.array([speaker_id]))  # add the embedding to the database with the unique speaker_id
+
+    faiss.write_index(db, db_file_path)  # save the database to a file
+
+    return db
+
+def process_segments_json(run_id):
+    with open(f'{run_id}/segments.json', 'r') as f:
+        data = json.load(f)
+
+    embeddings = data['speakers']['embeddings']
+    db = insert_embeddings_to_faiss_db(embeddings, run_id)
+
+    return db
+
 
 def generate_embeddings(run_id, speakers_text):
     logging.info("Embedding sentences in transcripts...")
@@ -89,11 +138,11 @@ def extract_all_samples_per_speaker(run_id):
             # Generate transcript for segment_audio
             # Use openai model
             temp_filename = "/tmp/temp_audio.mp3"
-            # segment_audio.set_channels(1)
-            # segment_audio.set_frame_rate(16000)
+            
             segment_audio.export(temp_filename, format="mp3")
             
             # Skip if temp_filename is more than 20MB
+            # TODO: don't skip; should be able to handle this with mp3s
             if os.path.getsize(temp_filename) > 20000000:
                 print(f"Skipping segment {start_time}-{end_time} for speaker {speaker_label} because it is too large.")
                 continue
@@ -176,6 +225,7 @@ if __name__ == "__main__":
 
     
     # Create a unique identifier for this run
+    
     run_id = str(uuid.uuid4()) 
 
     # Create a directory for this run
@@ -198,5 +248,8 @@ if __name__ == "__main__":
 
     extract_all_samples_per_speaker(run_id)
 
+    process_segments_json(run_id)
+    
+    
     # TODO: Youtube download / extract / convert to wav
     # TODO: Speaker detection against existing database using embeddings from segment.json
