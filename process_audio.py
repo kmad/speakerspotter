@@ -16,47 +16,85 @@ import os
 import numpy as np
 import faiss
 
-def insert_embeddings_to_faiss_db(embeddings, run_id):
+def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     dimension = len(next(iter(embeddings.values())))  # get the dimension size from the first embedding vector
+    
+    # Load FAISS database
     db_file_path = f"faiss_db.index"  # define the path to save the faiss database
-
     if os.path.exists(db_file_path):  # if the database file exists
         db = faiss.read_index(db_file_path)  # load the database from the file
     else:
         db = faiss.IndexIDMap(faiss.IndexFlatL2(dimension))  # create a new faiss database with L2 distance metric
 
+    # Load speaker map
+    try:
+        with open('speaker_map.json', 'r') as f: # TODO: Make configurable
+            speaker_map = json.load(f)
+    except:
+        speaker_map = {}
+
+    count = 0
     for speaker, embedding in embeddings.items():
+        if len(speaker_list) > 0:
+            logging.info(f"Processing labeled speaker {speaker_list[count]}")
+
         embedding_np = np.asarray(embedding).astype('float32')  # convert the embedding to numpy array
         embedding_np = np.expand_dims(embedding_np, axis=0)  # add an extra dimension for faiss
 
         # Create a unique ID for each speaker using the run_id and speaker label
-        # TODO: Can we use ascii > int for this?
         speaker_id = int(hashlib.sha1(f"{run_id}_{speaker}".encode()).hexdigest(), 16) % (10 ** 8)
+        logging.info(f"Speaker {speaker} has ID {speaker_id} // {run_id}")
+        if len(speaker_list) > 0:
+            # Add the speaker to the speaker map
+            speaker_map[str(speaker_id)] = speaker_list[count]
 
         if db.ntotal > 0:  # if the database is not empty
             # compute the cosine distance between the new embedding and all existing embeddings in the database
             distances, _ = db.search(embedding_np, db.ntotal) # TODO: Do we need all of these?
             
             logging.info(f"{speaker} min distance: {np.min(distances)}")
+            #########
+            # Search for similar embeddings
+            THRESHOLD = 50_000
+            r = db.range_search(embedding_np, THRESHOLD)
+            num_results = r[0][1]
+            id_list = list(r[2])
+            
+            # Get the speaker name from the speaker map
+            identified_speakers = set()
+            for _id in id_list:
+                identified_speakers.add(speaker_map.get(str(_id), "Unknown"))
 
-            if np.min(distances) < 0.01:  # if the minimum distance is less than 0.01, the speaker already exists
+            logging.info(f"Identified speakers: {identified_speakers} across {num_results} entries.")
+            if len(identified_speakers) > 0 and list(identified_speakers)[0] == speaker_list[count]:
+                logging.info("Speaker DB agrees with provided label.")
+            ###########
+
+            if np.min(distances) < 0.01:  # if the minimum distance is less than 0.01, the exact embedding exists
                 logging.info(f"Speaker {speaker} already exists in the database.")
+                count += 1
                 continue
             else:
-                logging.info(f"Speaker {speaker} is new. Adding to the database.")
+                logging.info(f"Speaker {speaker} embedding is new. Adding to the database.")
+            
+            
 
         db.add_with_ids(embedding_np, np.array([speaker_id]))  # add the embedding to the database with the unique speaker_id
+        count += 1
 
     faiss.write_index(db, db_file_path)  # save the database to a file
-
+    
+    # Write the speaker_map back to file
+    with open('speaker_map.json', 'w') as f:
+        json.dump(speaker_map, f)
     return db
 
-def process_segments_json(run_id):
+def process_segments_json(run_id, speaker_list):
     with open(f'{run_id}/segments.json', 'r') as f:
         data = json.load(f)
 
     embeddings = data['speakers']['embeddings']
-    db = insert_embeddings_to_faiss_db(embeddings, run_id)
+    db = insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list)
 
     return db
 
@@ -204,7 +242,7 @@ def diarize_audio(run_id, audio_path):
     return output_location
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
     load_dotenv()
     openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -214,6 +252,7 @@ if __name__ == "__main__":
     # Add the necessary command-line arguments
     parser.add_argument('-i', '--input', help='Path to the audio file')
     parser.add_argument('-v', '--verbose', help='Turn on verbose output of ffmpeg and whisper', action='store_true')
+    parser.add_argument('-s', '--speakers', help='Comma separated list of speakers in order of appearance', type=str)
 
     global args
 
@@ -223,6 +262,11 @@ if __name__ == "__main__":
     # Set the input parameters
     audio_path = args.input
 
+    try:
+        speaker_list = args.speakers.split(',')
+    except:
+        speaker_list = []
+        
     
     # Create a unique identifier for this run
     
@@ -237,7 +281,7 @@ if __name__ == "__main__":
     logging.info("Starting audio processing...")
     
     logging.info("Downloading audio file from URL...")
-    
+    # URL is arbitrary limitation due to APIs inability to process >20MB files
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
         f.write(r.content)
@@ -248,7 +292,7 @@ if __name__ == "__main__":
 
     extract_all_samples_per_speaker(run_id)
 
-    process_segments_json(run_id)
+    process_segments_json(run_id, speaker_list)
     
     
     # TODO: Youtube download / extract / convert to wav
