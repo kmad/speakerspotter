@@ -16,6 +16,17 @@ import os
 import numpy as np
 import faiss
 
+class DefaultList(list):
+    def __init__(self, default_value, *args):
+        self.default_value = default_value
+        super().__init__(*args)
+
+    def __getitem__(self, index):
+        try:
+            return super().__getitem__(index)
+        except IndexError:
+            return self.default_value
+        
 def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     dimension = len(next(iter(embeddings.values())))  # get the dimension size from the first embedding vector
     
@@ -35,27 +46,35 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
 
     count = 0
     for speaker, embedding in embeddings.items():
+        # Create a unique ID for each speaker using the run_id and speaker label
+        speaker_id = int(hashlib.sha1(f"{run_id}_{speaker}".encode()).hexdigest(), 16) % (10 ** 8)
+        logging.info(f"Speaker {speaker} has ID {speaker_id} // {run_id}")
+
+        speaker_label = f"Unknown-{speaker_id}"
         if len(speaker_list) > 0:
-            logging.info(f"Processing labeled speaker {speaker_list[count]}")
+            speaker_label = speaker_list[count]
+            logging.info(f"Processing labeled speaker {speaker_label}")
+            
 
         embedding_np = np.asarray(embedding).astype('float32')  # convert the embedding to numpy array
         embedding_np = np.expand_dims(embedding_np, axis=0)  # add an extra dimension for faiss
 
-        # Create a unique ID for each speaker using the run_id and speaker label
-        speaker_id = int(hashlib.sha1(f"{run_id}_{speaker}".encode()).hexdigest(), 16) % (10 ** 8)
-        logging.info(f"Speaker {speaker} has ID {speaker_id} // {run_id}")
-        if len(speaker_list) > 0:
-            # Add the speaker to the speaker map
-            speaker_map[str(speaker_id)] = speaker_list[count]
+        
 
         if db.ntotal > 0:  # if the database is not empty
+            
             # compute the cosine distance between the new embedding and all existing embeddings in the database
             distances, _ = db.search(embedding_np, db.ntotal) # TODO: Do we need all of these?
-            
+            if np.min(distances) < 0.01:  # if the minimum distance is less than 0.01, the exact embedding exists
+                logging.info(f"Speaker {speaker} already exists in the database.")
+            else:
+                logging.info(f"Speaker {speaker} embedding is new.")
             logging.info(f"{speaker} min distance: {np.min(distances)}")
+
+
             #########
             # Search for similar embeddings
-            THRESHOLD = 50_000
+            THRESHOLD = 45_000
             r = db.range_search(embedding_np, THRESHOLD)
             num_results = r[0][1]
             id_list = list(r[2])
@@ -63,22 +82,23 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
             # Get the speaker name from the speaker map
             identified_speakers = set()
             for _id in id_list:
-                identified_speakers.add(speaker_map.get(str(_id), "Unknown"))
+                to_add = speaker_map.get(str(_id))
+                if "Unknown" not in to_add:
+                    identified_speakers.add(to_add)
 
-            logging.info(f"Identified speakers: {identified_speakers} across {num_results} entries.")
-            if len(identified_speakers) > 0 and list(identified_speakers)[0] == speaker_list[count]:
+            if len(identified_speakers) > 0 and "Unknown" in speaker_label:
+                logging.info(f"Unknown speaker found! Using {list(identified_speakers)[0]}.")
+                speaker_label = list(identified_speakers)[0]
+            elif len(identified_speakers) > 0 and list(identified_speakers)[0] == speaker_label:
                 logging.info("Speaker DB agrees with provided label.")
-            ###########
-
-            if np.min(distances) < 0.01:  # if the minimum distance is less than 0.01, the exact embedding exists
-                logging.info(f"Speaker {speaker} already exists in the database.")
-                count += 1
-                continue
-            else:
-                logging.info(f"Speaker {speaker} embedding is new. Adding to the database.")
+            elif len(identified_speakers) > 0 and list(identified_speakers)[0] != speaker_label:
+                logging.warning(f"Speaker DB disagrees with provided label. Provided: {speaker_label} // Found:{list(identified_speakers)}.")
+            elif len(identified_speakers) > 0:
+                logging.info(f"Identified speakers: {identified_speakers} across {num_results} entries.")
             
-            
-
+        
+        # Add the speaker to the speaker map
+        speaker_map[str(speaker_id)] = speaker_label
         db.add_with_ids(embedding_np, np.array([speaker_id]))  # add the embedding to the database with the unique speaker_id
         count += 1
 
@@ -87,6 +107,7 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     # Write the speaker_map back to file
     with open('speaker_map.json', 'w') as f:
         json.dump(speaker_map, f)
+
     return db
 
 def process_segments_json(run_id, speaker_list):
@@ -210,8 +231,6 @@ def extract_all_samples_per_speaker(run_id):
         # Output audio
         output_path = f'{run_id}/{speaker_label}.mp3'
         logging.info(f"Exporting segment for speaker {speaker_label} to {output_path}")
-        # speaker_audio.set_channels(1)
-        # speaker_audio.set_frame_rate(16000)
         speaker_audio.export(output_path, format="mp3")
         
     logging.info("All audio segments processed.")
@@ -263,11 +282,10 @@ if __name__ == "__main__":
     audio_path = args.input
 
     try:
-        speaker_list = args.speakers.split(',')
+        speaker_list = DefaultList('Unknown', args.speakers.split(','))
     except:
-        speaker_list = []
+        speaker_list = DefaultList('Unknown', [])
         
-    
     # Create a unique identifier for this run
     
     run_id = str(uuid.uuid4()) 
@@ -285,8 +303,7 @@ if __name__ == "__main__":
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
         f.write(r.content)
-    
-    # TODO: mp3 vs wav
+
     
     diarize_audio(run_id, audio_path)
 
@@ -296,4 +313,3 @@ if __name__ == "__main__":
     
     
     # TODO: Youtube download / extract / convert to wav
-    # TODO: Speaker detection against existing database using embeddings from segment.json
