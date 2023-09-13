@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from io import BytesIO
-import requests
 from sentence_transformers import SentenceTransformer
-from multiprocessing import Pool
 from dotenv import load_dotenv
 from pydub import AudioSegment
-import subprocess
 import replicate
 import argparse
+import requests
 import logging
 import openai
 import json
