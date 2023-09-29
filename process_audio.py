@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import hashlib
+import shutil
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from pydub import AudioSegment
+import subprocess
 import replicate
 import argparse
 import requests
@@ -31,7 +33,11 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     dimension = len(next(iter(embeddings.values())))  # get the dimension size from the first embedding vector
     
     # Load FAISS database
-    db_file_path = f"faiss_db.index"  # define the path to save the faiss database
+    if os.getenv("faiss_db_file_path") is not None:
+        db_file_path = os.getenv("SPEAKER_DB_PATH")
+    else:
+        db_file_path = f"speaker_db.index"  # define the path to save the faiss database
+
     if os.path.exists(db_file_path):  # if the database file exists
         db = faiss.read_index(db_file_path)  # load the database from the file
     else:
@@ -199,15 +205,46 @@ def extract_all_samples_per_speaker(run_id):
             temp_filename = "/tmp/temp_audio.mp3"
             
             segment_audio.export(temp_filename, format="mp3")
-            
+            duration_seconds = segment_audio.duration_seconds
             # Skip if temp_filename is more than 20MB
             # TODO: don't skip; should be able to handle this with mp3s
+            logging.info(f"Processing segment of {duration_seconds} seconds.")
             if os.path.getsize(temp_filename) > 20000000:
                 print(f"Skipping segment {start_time}-{end_time} for speaker {speaker_label} because it is too large.")
                 continue
 
-            with open(temp_filename, 'rb') as audio_file:
-                output = openai.Audio.transcribe("whisper-1", audio_file)
+            try:
+                with open(temp_filename, 'rb') as audio_file:
+                    output = openai.Audio.transcribe("whisper-1", audio_file)
+            except:
+                print(f"Split segment {start_time}-{end_time} for speaker {speaker_label} because it failed to transcribe.")
+            
+                # Get the full length of the segment
+                segment_length = end_time - start_time
+                
+                from io import BytesIO
+                # Split the segment in half and attempt to transcribe each half
+                segment_audio_1 = segment_audio[:segment_length//2]
+                # Transcribe the first half of the segment
+                audio_file_1 = BytesIO()
+                segment_audio_1.export(audio_file_1, format="mp3")
+                audio_file_1.seek(0)
+                transcription_1 = openai.Audio.transcribe("whisper-1", audio_file_1)
+
+                # Get the second half of the segment
+                segment_audio_2 = segment_audio[segment_length//2:]
+
+                # Transcribe the second half of the segment
+                audio_file_2 = BytesIO()
+                segment_audio_2.export(audio_file_2, format="mp3")
+                audio_file_2.seek(0)
+                transcription_2 = openai.Audio.transcribe("whisper-1", audio_file_2)
+
+                # Combine the transcriptions
+                full_transcription = transcription_1 + " " + transcription_2
+                output = {"text": full_transcription}
+                
+                
             
             # Add to speaker's transcript
             if speaker_label not in speakers_text:
@@ -280,7 +317,7 @@ if __name__ == "__main__":
 
     # Set the input parameters
     audio_path = args.input
-
+    
     try:
         speaker_list = DefaultList('Unknown', args.speakers.split(','))
     except:
@@ -298,18 +335,16 @@ if __name__ == "__main__":
     # Use pyannote to extract one sample per speaker
     logging.info("Starting audio processing...")
     
+
     logging.info("Downloading audio file from URL...")
-    # URL is arbitrary limitation due to APIs inability to process >20MB files
+    
+
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
         f.write(r.content)
-
     
     diarize_audio(run_id, audio_path)
 
     extract_all_samples_per_speaker(run_id)
 
     process_segments_json(run_id, speaker_list)
-    
-    
-    # TODO: Youtube download / extract / convert to wav
