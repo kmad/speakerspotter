@@ -10,6 +10,7 @@ import replicate
 import argparse
 import requests
 import logging
+import random
 import openai
 import json
 import uuid
@@ -48,6 +49,7 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         with open('speaker_map.json', 'r') as f: # TODO: Make configurable
             speaker_map = json.load(f)
     except:
+        logging.warn("First run? Speaker map not found. Creating new speaker map.")
         speaker_map = {}
 
     count = 0
@@ -65,7 +67,6 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         embedding_np = np.asarray(embedding).astype('float32')  # convert the embedding to numpy array
         embedding_np = np.expand_dims(embedding_np, axis=0)  # add an extra dimension for faiss
 
-        
 
         if db.ntotal > 0:  # if the database is not empty
             
@@ -73,6 +74,7 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
             distances, _ = db.search(embedding_np, db.ntotal) # TODO: Do we need all of these?
             if np.min(distances) < 0.01:  # if the minimum distance is less than 0.01, the exact embedding exists
                 logging.info(f"Speaker {speaker} already exists in the database.")
+                
             else:
                 logging.info(f"Speaker {speaker} embedding is new.")
             logging.info(f"{speaker} min distance: {np.min(distances)}")
@@ -88,12 +90,12 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
             # Get the speaker name from the speaker map
             identified_speakers = set()
             for _id in id_list:
-                to_add = speaker_map.get(str(_id))
+                to_add = speaker_map.get(str(_id), "Unknown")
                 if "Unknown" not in to_add:
                     identified_speakers.add(to_add)
 
             if len(identified_speakers) > 0 and "Unknown" in speaker_label:
-                logging.info(f"Unknown speaker found! Using {list(identified_speakers)[0]}.")
+                logging.info(f"Unknown speaker found: using {list(identified_speakers)[0]}.")
                 speaker_label = list(identified_speakers)[0]
             elif len(identified_speakers) > 0 and list(identified_speakers)[0] == speaker_label:
                 logging.info("Speaker DB agrees with provided label.")
@@ -106,6 +108,19 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         # Add the speaker to the speaker map
         speaker_map[str(speaker_id)] = speaker_label
         db.add_with_ids(embedding_np, np.array([speaker_id]))  # add the embedding to the database with the unique speaker_id
+
+        # Update the speaker map
+        speaker_names = set([speaker_map[str(i)] for i in id_list])
+        # Filter out anything starting with "Unknown"
+        speaker_names = [name for name in speaker_names if not name.startswith("Unknown")]
+        # If we have one result, that's the name to replace all other unknowns with
+        if len(speaker_names) == 1:
+            # Update instances of the speaker map from id_list, using the name
+            speaker_map = {**speaker_map, **{str(i): speaker_names[0] for i in id_list}}
+            logging.info(f"Updated {len(id_list)} entries with speaker name {speaker_names[0]}")
+        elif len(speaker_names) > 1:
+            print(f"Found multiple speakers: {speaker_names}. This requires a deconflict.")
+            
         count += 1
 
     faiss.write_index(db, db_file_path)  # save the database to a file
@@ -197,12 +212,22 @@ def extract_all_samples_per_speaker(run_id):
     speakers_text = {}
 
     for speaker_label, segments in speakers_segments.items():
-        for start_time, end_time in segments:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+
+        # Define a lock object to synchronize threads
+        lock = threading.Lock()
+
+        # Define a function to process each segment
+        def process_segment(segment):
+            start_time, end_time = segment
             segment_audio = original_audio[start_time:end_time]
 
             # Generate transcript for segment_audio
             # Use openai model
-            temp_filename = "/tmp/temp_audio.mp3"
+            # Generate a random number or other identifier to allow for running in parallel
+           
+            temp_filename = f"/tmp/temp_audio_{random.randint(1, 100000)}.mp3"
             
             segment_audio.export(temp_filename, format="mp3")
             duration_seconds = segment_audio.duration_seconds
@@ -211,7 +236,7 @@ def extract_all_samples_per_speaker(run_id):
             logging.info(f"Processing segment of {duration_seconds} seconds.")
             if os.path.getsize(temp_filename) > 20000000:
                 print(f"Skipping segment {start_time}-{end_time} for speaker {speaker_label} because it is too large.")
-                continue
+                return
 
             try:
                 with open(temp_filename, 'rb') as audio_file:
@@ -244,24 +269,39 @@ def extract_all_samples_per_speaker(run_id):
                 full_transcription = transcription_1 + " " + transcription_2
                 output = {"text": full_transcription}
                 
-                
-            
             # Add to speaker's transcript
-            if speaker_label not in speakers_text:
-                speakers_text[speaker_label] = output['text']
-            else:
-                speakers_text[speaker_label] += output['text'] + " "
+            with lock:
+                if speaker_label not in speakers_text:
+                    speakers_text[speaker_label] = [(start_time, output['text'] + " ")]
+                else:
+                    speakers_text[speaker_label].append((start_time, output['text'] + " "))
 
-            # Add audio segments
-            if speaker_label not in speakers_audio:
-                speakers_audio[speaker_label] = segment_audio
-            else:
-                speakers_audio[speaker_label] += segment_audio
+                # Add audio segments
+                if speaker_label not in speakers_audio:
+                    speakers_audio[speaker_label] = [(start_time, segment_audio)]
+                else:
+                    speakers_audio[speaker_label].append((start_time, segment_audio))
 
+        # Use a ThreadPoolExecutor to run the process_segment function in parallel for each segment
+        with ThreadPoolExecutor() as executor:
+            executor.map(process_segment, segments)
+
+
+     # Sort the audio segments by start_time to ensure they are in order
+    
+    for speaker_label in speakers_audio.keys():
+        speakers_audio[speaker_label].sort(key=lambda x: x[0])
+        speakers_audio[speaker_label] = sum([audio for _, audio in speakers_audio[speaker_label]])
+    
     for speaker_label, speaker_audio in speakers_audio.items():
+            # Sort the transcripts by start_time to ensure they are in order
+        speakers_text[speaker_label].sort(key=lambda x: x[0])
+        speakers_text[speaker_label] = " ".join([text for _, text in speakers_text[speaker_label]])
+        
         # Output transcript
         transcript_path = f'{run_id}/{speaker_label}-TRANSCRIPT.txt'
         logging.info(f"Exporting transcript for speaker {speaker_label} to {transcript_path}")
+
         with open(transcript_path, "w") as f:
             f.write(speakers_text[speaker_label])
 
@@ -338,6 +378,12 @@ if __name__ == "__main__":
 
     logging.info("Downloading audio file from URL...")
     
+    if "youtube.com" in audio_path:
+        logging.info("Downloading from YouTube...")
+        ENDPOINT = os.getenv("YT_ENDPOINT")
+        full_url = ENDPOINT + audio_path
+        audio_path = requests.get(full_url).text
+        logging.info(f"Using generated audio URL {audio_path}")
 
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
@@ -348,3 +394,4 @@ if __name__ == "__main__":
     extract_all_samples_per_speaker(run_id)
 
     process_segments_json(run_id, speaker_list)
+
