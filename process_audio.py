@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import hashlib
 import shutil
+import time
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from pydub import AudioSegment
@@ -10,6 +11,7 @@ import replicate
 import argparse
 import requests
 import logging
+import whisper
 import random
 import openai
 import json
@@ -174,6 +176,10 @@ def generate_embeddings(run_id, speakers_text):
     logging.info("All sentences in transcripts embedded.")
     
 def extract_all_samples_per_speaker(run_id):
+    if os.getenv('USE_LOCAL_WHISPER') == "1":
+        logging.info("Using local whisper model.")
+        model = whisper.load_model("base")
+
     INPUT_PATH = f'{run_id}/input.mp3' 
 
     logging.info("Extracting all samples per speaker...")
@@ -210,14 +216,16 @@ def extract_all_samples_per_speaker(run_id):
     logging.info("Segmenting audio...")
     speakers_audio = {}
     speakers_text = {}
+    
+
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    # Define a lock object to synchronize threads
+    lock = threading.Lock()
 
     for speaker_label, segments in speakers_segments.items():
-        from concurrent.futures import ThreadPoolExecutor
-        import threading
-
-        # Define a lock object to synchronize threads
-        lock = threading.Lock()
-
+        
         # Define a function to process each segment
         def process_segment(segment):
             start_time, end_time = segment
@@ -239,35 +247,25 @@ def extract_all_samples_per_speaker(run_id):
                 return
 
             try:
-                with open(temp_filename, 'rb') as audio_file:
-                    output = openai.Audio.transcribe("whisper-1", audio_file)
-            except:
-                print(f"Split segment {start_time}-{end_time} for speaker {speaker_label} because it failed to transcribe.")
-            
-                # Get the full length of the segment
-                segment_length = end_time - start_time
-                
-                from io import BytesIO
-                # Split the segment in half and attempt to transcribe each half
-                segment_audio_1 = segment_audio[:segment_length//2]
-                # Transcribe the first half of the segment
-                audio_file_1 = BytesIO()
-                segment_audio_1.export(audio_file_1, format="mp3")
-                audio_file_1.seek(0)
-                transcription_1 = openai.Audio.transcribe("whisper-1", audio_file_1)
+                if os.getenv('USE_LOCAL_WHISPER') == "1":
+                    output = model.transcribe(temp_filename, fp16=False, language='English')
+                else:
+                    # Rate limit handling
+                    RATE_LIMIT = 50  # requests per minute
+                    time_per_request = 60.0 / RATE_LIMIT
+                    last_request_time = 0 if 'last_request_time' not in globals() else globals()['last_request_time']
+                    time_since_last_request = time.time() - last_request_time
 
-                # Get the second half of the segment
-                segment_audio_2 = segment_audio[segment_length//2:]
+                    if time_since_last_request < time_per_request:
+                        logging.warning(f"Rate limiting: waiting {time_per_request - time_since_last_request} seconds.")
+                        time.sleep(time_per_request - time_since_last_request)
 
-                # Transcribe the second half of the segment
-                audio_file_2 = BytesIO()
-                segment_audio_2.export(audio_file_2, format="mp3")
-                audio_file_2.seek(0)
-                transcription_2 = openai.Audio.transcribe("whisper-1", audio_file_2)
+                    with open(temp_filename, 'rb') as audio_file:
+                        output = openai.Audio.transcribe("whisper-1", audio_file)
+                        globals()['last_request_time'] = time.time()
+            except Exception as e:
+                logging.error(f"Error transcribing segment {start_time}-{end_time} for speaker {speaker_label}: {e}")
 
-                # Combine the transcriptions
-                full_transcription = transcription_1 + " " + transcription_2
-                output = {"text": full_transcription}
                 
             # Add to speaker's transcript
             with lock:
@@ -283,9 +281,15 @@ def extract_all_samples_per_speaker(run_id):
                     speakers_audio[speaker_label].append((start_time, segment_audio))
 
         # Use a ThreadPoolExecutor to run the process_segment function in parallel for each segment
-        with ThreadPoolExecutor() as executor:
+        
+        MAX_WORKERS = 4 if os.getenv('USE_LOCAL_WHISPER') == "1" else 8
+        logging.info(f"Using {MAX_WORKERS} workers to transcribe.")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             executor.map(process_segment, segments)
-
+            executor.shutdown(wait=True)
+        
+        # for segment in segments:
+        #     process_segment(segment)
 
      # Sort the audio segments by start_time to ensure they are in order
     
