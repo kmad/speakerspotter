@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import hashlib
-import shutil
-import time
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from pydub import AudioSegment
-import subprocess
+import numpy as np
 import replicate
 import argparse
 import requests
 import logging
 import whisper
+import sqlite3
 import random
 import openai
+import hashlib
+import faiss
+import time
 import json
 import uuid
 import os
-
-import numpy as np
-import faiss
 
 class DefaultList(list):
     def __init__(self, default_value, *args):
@@ -31,8 +29,11 @@ class DefaultList(list):
             return super().__getitem__(index)
         except IndexError:
             return self.default_value
-        
-def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
+
+def getSpeakerId(run_id, speaker):
+    return int(hashlib.sha1(f"{run_id}_{speaker}".encode()).hexdigest(), 16) % (10 ** 8)
+
+def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     dimension = len(next(iter(embeddings.values())))  # get the dimension size from the first embedding vector
     
     # Load FAISS database
@@ -57,7 +58,7 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     count = 0
     for speaker, embedding in embeddings.items():
         # Create a unique ID for each speaker using the run_id and speaker label
-        speaker_id = int(hashlib.sha1(f"{run_id}_{speaker}".encode()).hexdigest(), 16) % (10 ** 8)
+        speaker_id = getSpeakerId(run_id, speaker)
         logging.info(f"Speaker {speaker} has ID {speaker_id} // {run_id}")
 
         speaker_label = f"Unknown-{speaker_id}"
@@ -110,15 +111,21 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         # Add the speaker to the speaker map
         speaker_map[str(speaker_id)] = speaker_label
         db.add_with_ids(embedding_np, np.array([speaker_id]))  # add the embedding to the database with the unique speaker_id
+        
+        # Add speaker to the database
+        cursor.execute("INSERT INTO speakers (id, name, run_id) VALUES (?, ?, ?)", (speaker_id, speaker_label, run_id))
+        conn.commit()
 
-        # Update the speaker map
+        # Update the speaker map in the database
         speaker_names = set([speaker_map[str(i)] for i in id_list])
         # Filter out anything starting with "Unknown"
         speaker_names = [name for name in speaker_names if not name.startswith("Unknown")]
         # If we have one result, that's the name to replace all other unknowns with
         if len(speaker_names) == 1:
             # Update instances of the speaker map from id_list, using the name
-            speaker_map = {**speaker_map, **{str(i): speaker_names[0] for i in id_list}}
+            for i in id_list:
+                cursor.execute("UPDATE speakers SET name = ? WHERE id = ?", (speaker_names[0], i))
+            conn.commit()
             logging.info(f"Updated {len(id_list)} entries with speaker name {speaker_names[0]}")
         elif len(speaker_names) > 1:
             print(f"Found multiple speakers: {speaker_names}. This requires a deconflict.")
@@ -132,16 +139,6 @@ def insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         json.dump(speaker_map, f)
 
     return db
-
-def process_segments_json(run_id, speaker_list):
-    with open(f'{run_id}/segments.json', 'r') as f:
-        data = json.load(f)
-
-    embeddings = data['speakers']['embeddings']
-    db = insert_embeddings_to_faiss_db(embeddings, run_id, speaker_list)
-
-    return db
-
 
 def generate_embeddings(run_id, speakers_text):
     logging.info("Embedding sentences in transcripts...")
@@ -223,7 +220,7 @@ def extract_all_samples_per_speaker(run_id):
 
     # Define a lock object to synchronize threads
     lock = threading.Lock()
-
+    
     for speaker_label, segments in speakers_segments.items():
         
         # Define a function to process each segment
@@ -269,6 +266,8 @@ def extract_all_samples_per_speaker(run_id):
                 
             # Add to speaker's transcript
             with lock:
+                speaker_id = getSpeakerId(run_id, speaker_label)
+                logging.info("Speaker ID: " + str(speaker_id))
                 if speaker_label not in speakers_text:
                     speakers_text[speaker_label] = [(start_time, output['text'] + " ")]
                 else:
@@ -279,17 +278,25 @@ def extract_all_samples_per_speaker(run_id):
                     speakers_audio[speaker_label] = [(start_time, segment_audio)]
                 else:
                     speakers_audio[speaker_label].append((start_time, segment_audio))
+                
+                # Add to segments table
+                cursor.execute("""
+                    INSERT INTO segments (run_id, speaker_id, start_time, end_time, transcript)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (run_id, speaker_id, start_time, end_time, output['text']))
+                conn.commit()
 
         # Use a ThreadPoolExecutor to run the process_segment function in parallel for each segment
         
-        MAX_WORKERS = 4 if os.getenv('USE_LOCAL_WHISPER') == "1" else 8
-        logging.info(f"Using {MAX_WORKERS} workers to transcribe.")
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            executor.map(process_segment, segments)
-            executor.shutdown(wait=True)
+        # MAX_WORKERS = 4 if os.getenv('USE_LOCAL_WHISPER') == "1" else 8
+        # logging.info(f"Using {MAX_WORKERS} workers to transcribe.")
+        # with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        #     executor.map(process_segment, segments)
+        #     executor.shutdown(wait=True)
         
-        # for segment in segments:
-        #     process_segment(segment)
+        # This works; above there's an issue with stitching things back together?
+        for segment in segments:
+            process_segment(segment)
 
      # Sort the audio segments by start_time to ensure they are in order
     
@@ -328,7 +335,7 @@ def diarize_audio(run_id, audio_path):
     output_location = replicate.run(
         "lucataco/speaker-diarization:718182bfdc7c91943c69ed0ac18ebe99a76fdde67ccd01fced347d8c3b8c15a6",
         input={"audio": audio_path}
-        #input={"audio": open(audio_path, "rb")}
+        #input={"audio": open(audio_path, "rb")} # This errors out with larger files (typically > 20MB)
     )
     
     logging.info("Diarization complete.")
@@ -336,15 +343,110 @@ def diarize_audio(run_id, audio_path):
     # Replicate saves the results elsewhere
     r = requests.get(output_location)
     # Save output to run_id folder
+    diarize_output = r.json()
     with open(f'{run_id}/segments.json', "w") as f:
-        json.dump(r.json(), f)
+        json.dump(diarize_output, f)
     
+    for elt in diarize_output['segments']:
+        speaker = elt['speaker']
+        start = elt['start']
+        stop = elt['stop']
+        speaker_id = getSpeakerId(run_id, speaker)
+        cursor.execute("INSERT INTO diarize_segments (run_id, speaker, speaker_id, start, stop) VALUES  (?,?,?,?,?)", (run_id, speaker, speaker_id, start, stop))
+
+    for speaker in diarize_output['speakers']['embeddings'].keys():
+        speaker_id = getSpeakerId(run_id, speaker)
+        embeddings = diarize_output['speakers']['embeddings'][speaker]
+        cursor.execute("INSERT INTO diarize_embeddings (run_id, speaker, speaker_id, embeddings) VALUES  (?,?,?,?)", (run_id, speaker, speaker_id, str(embeddings)))
+        # TODO: proper embeddings storage
+
+    conn.commit()
+
     return output_location
 
+def create_schema(DB_PATH):
+    # Open a new sqlite3 connection
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY,
+            input_path TEXT NOT NULL,
+            output_path TEXT NOT NULL,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    # Create the schema
+    cursor.execute("""
+        CREATE TABLE speakers (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            run_id TEXT NOT NULL
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE segments ( 
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            speaker_id INTEGER NOT NULL,
+            start_time INTEGER NOT NULL,
+            end_time INTEGER NOT NULL,
+            transcript TEXT NOT NULL,
+            run_id TEXT NOT NULL
+            --FOREIGN KEY (speaker_id) REFERENCES speakers (id)
+            --FOREIGN KEY (run_id) REFERENCES runs (run_id)
+        ); 
+    """)
+
+    cursor.execute("""
+        CREATE TABLE diarize_segments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            speaker TEXT NOT NULL,
+            speaker_id INTEGER NOT NULL,
+            run_id TEXT NOT NULL
+            start TEXT NOT NULL,
+            stop TEXT NOT NULL,
+    
+        );
+    """)
+
+    cursor.execute("""
+        CREATE TABLE diarize_embeddings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            speaker INTEGER NOT NULL,
+            speaker_id INTEGER NOT NULL,
+            run_id TEXT NOT NULL
+            embeddings TEXT NOT NULL,
+        );
+        """)
+    
+    conn.commit()
+    conn.close()
+
+
 if __name__ == "__main__":
+    load_dotenv()
+    # TODO: Use https://github.com/asg017/sqlite-vss ?
+    
+    # Check if the database file exists
+    
+    DB_PATH = os.getenv('DB_PATH')
+    if not DB_PATH:
+        logging.error("DB_PATH not set. Using default speakers.db")
+        DB_PATH = "speakers.db"
+
+    if not os.path.isfile(DB_PATH):
+        # If the database file doesn't exist, create it and initialize the schema
+        create_schema(DB_PATH)
+    
+    global cursor, conn
+    # Open a new sqlite3 connection
+    conn = sqlite3.connect(DB_PATH)
+    # Create a global cursor
+    cursor = conn.cursor()
+
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
-    load_dotenv()
     openai.api_key = os.getenv("OPENAI_API_KEY")
     # Create an ArgumentParser object
     parser = argparse.ArgumentParser()
@@ -379,10 +481,10 @@ if __name__ == "__main__":
     # Use pyannote to extract one sample per speaker
     logging.info("Starting audio processing...")
     
-
     logging.info("Downloading audio file from URL...")
     
     if "youtube.com" in audio_path:
+        audio_path_orig = audio_path
         logging.info("Downloading from YouTube...")
         ENDPOINT = os.getenv("YT_ENDPOINT")
         full_url = ENDPOINT + audio_path
@@ -392,10 +494,22 @@ if __name__ == "__main__":
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
         f.write(r.content)
+
+    
+    # Insert a row of data
+    cursor.execute("INSERT INTO runs (run_id, input_path, output_path) VALUES (?,?,?)", (run_id, audio_path_orig, audio_path))
+    
+    # Save (commit) the changes
+    conn.commit()
     
     diarize_audio(run_id, audio_path)
 
     extract_all_samples_per_speaker(run_id)
 
-    process_segments_json(run_id, speaker_list)
+    with open(f'{run_id}/segments.json', 'r') as f:
+        data = json.load(f)
 
+    embeddings = data['speakers']['embeddings']
+    insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list)
+    
+    conn.close()
