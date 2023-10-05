@@ -7,6 +7,7 @@ import numpy as np
 import replicate
 import argparse
 import requests
+import chromadb
 import logging
 import whisper
 import sqlite3
@@ -140,38 +141,6 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         json.dump(speaker_map, f)
 
     return db
-
-def generate_embeddings(run_id, speakers_text):
-    logging.info("Embedding sentences in transcripts...")
-    
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    embeddings_path = os.getenv("embeddings_file")
-
-    # TODO: Replace with a more scalable solution
-    output_object  = {
-            "run_id": run_id,
-            "speakers": list(speakers_text.keys()),
-            "data" : {}
-        }
-
-    for speaker_label in speakers_text.keys():
-
-        sentences = [sentence.strip() for sentence in speakers_text[speaker_label].split('. ') if sentence]
-
-        # TODO: Offload to GPU or AI call
-        embeddings = model.encode(sentences)
-        
-        logging.info(f"Generated embeddings: {len(embeddings)}")
-        
-        # TODO: replace with np.save or a vector db, when appropriate
-        output_object["data"][speaker_label] = [x for x in embeddings.tolist()]
-        
-    # TODO: Use a more mature solution
-    with open(embeddings_path, 'a') as f:
-        f.write(json.dumps(output_object))
-        f.write('\n')
-        
-    logging.info("All sentences in transcripts embedded.")
     
 def extract_all_samples_per_speaker(run_id):
     if os.getenv('USE_LOCAL_WHISPER') == "1":
@@ -300,33 +269,41 @@ def extract_all_samples_per_speaker(run_id):
             process_segment(segment)
 
      # Sort the audio segments by start_time to ensure they are in order
-    
+    # TODO: Sort in place does this work?
     for speaker_label in speakers_audio.keys():
         speakers_audio[speaker_label].sort(key=lambda x: x[0])
         speakers_audio[speaker_label] = sum([audio for _, audio in speakers_audio[speaker_label]])
     
+    chroma_collection = chroma.get_or_create_collection("transcript_embeddings")
+
     for speaker_label, speaker_audio in speakers_audio.items():
-            # Sort the transcripts by start_time to ensure they are in order
+        # Sort the transcripts by start_time to ensure they are in order
         speakers_text[speaker_label].sort(key=lambda x: x[0])
-        speakers_text[speaker_label] = " ".join([text for _, text in speakers_text[speaker_label]])
+        speakers_text[speaker_label+"_fulltext"] = " ".join([text for _, text in speakers_text[speaker_label]])
         
         # Output transcript
         transcript_path = f'{run_id}/{speaker_label}-TRANSCRIPT.txt'
         logging.info(f"Exporting transcript for speaker {speaker_label} to {transcript_path}")
 
         with open(transcript_path, "w") as f:
-            f.write(speakers_text[speaker_label])
+            f.write(speakers_text[speaker_label+"_fulltext"])
 
         # Output audio
         output_path = f'{run_id}/{speaker_label}.mp3'
         logging.info(f"Exporting segment for speaker {speaker_label} to {output_path}")
         speaker_audio.export(output_path, format="mp3")
+
+        speaker_id = getSpeakerId(run_id, speaker_label)
+        logging.info("Generating embeddings...")
+        # Embed and store
+        chroma_collection.add(
+              ids = [f"{run_id}_{speaker_id}_{start}" for start, _ in speakers_text[speaker_label]]
+            , documents = [text for _, text in speakers_text[speaker_label]]
+            , metadatas = [{'run_id': run_id, 'speaker_id': speaker_id, 'speaker_label': speaker_label, 'start': start} for start, _ in speakers_text[speaker_label]]
+            #, embeddings = [list(x) for x in embeddings], # chroma embeds these automatically
+        )  
         
     logging.info("All audio segments processed.")
-
-    logging.info("Generating embeddings...")
-
-    generate_embeddings(run_id, speakers_text)
     
 def diarize_audio(run_id, audio_path):
  
@@ -404,10 +381,9 @@ def create_schema(DB_PATH):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             speaker TEXT NOT NULL,
             speaker_id INTEGER NOT NULL,
-            run_id TEXT NOT NULL
+            run_id TEXT NOT NULL,
             start TEXT NOT NULL,
-            stop TEXT NOT NULL,
-    
+            stop TEXT NOT NULL
         );
     """)
 
@@ -416,8 +392,8 @@ def create_schema(DB_PATH):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             speaker INTEGER NOT NULL,
             speaker_id INTEGER NOT NULL,
-            run_id TEXT NOT NULL
-            embeddings TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            embeddings TEXT NOT NULL
         );
         """)
     
@@ -439,6 +415,15 @@ if __name__ == "__main__":
         # If the database file doesn't exist, create it and initialize the schema
         create_schema(DB_PATH)
     
+    # Chromadb
+    CHROMA_PATH = os.getenv('CHROMA_PATH')
+    if not CHROMA_PATH:
+        logging.error("CHROMA_PATH not set. Using default chroma")
+        CHROMA_PATH = "chroma"
+   
+    global chroma
+    chroma = chromadb.PersistentClient(path=CHROMA_PATH)
+
     global cursor, conn
     # Open a new sqlite3 connection
     conn = sqlite3.connect(DB_PATH)
@@ -492,20 +477,27 @@ if __name__ == "__main__":
     logging.info("Downloading audio file from URL...")
     
     if "youtube.com" in audio_path:
-        audio_path_orig = audio_path
+        
+        original_audio_path = audio_path
         logging.info("Downloading from YouTube...")
         ENDPOINT = os.getenv("YT_ENDPOINT")
         full_url = ENDPOINT + audio_path
         audio_path = requests.get(full_url).text
         logging.info(f"Using generated audio URL {audio_path}")
 
+        # Check if the youtube link is already in the runs database
+        cursor.execute("SELECT * FROM runs WHERE input_path=?", (original_audio_path,))
+        if cursor.fetchone() is not None:
+            logging.error("The youtube link is already in the runs database.")
+            os.exit(1)
+
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
         f.write(r.content)
-
+    
     
     # Insert a row of data
-    cursor.execute("INSERT INTO runs (run_id, input_path, output_path) VALUES (?,?,?)", (run_id, audio_path_orig, audio_path))
+    cursor.execute("INSERT INTO runs (run_id, input_path, output_path) VALUES (?,?,?)", (run_id, original_audio_path, audio_path))
     
     # Save (commit) the changes
     conn.commit()
