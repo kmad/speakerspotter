@@ -48,6 +48,7 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         db = faiss.IndexIDMap(faiss.IndexFlatL2(dimension))  # create a new faiss database with L2 distance metric
 
     # Load speaker map
+    # TODO: Replace with db calls
     try:
         with open('speaker_map.json', 'r') as f: # TODO: Make configurable
             speaker_map = json.load(f)
@@ -63,7 +64,7 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
 
         speaker_label = f"Unknown-{speaker_id}"
         if len(speaker_list) > 0:
-            speaker_label = speaker_list[count]
+            speaker_label = speaker_list[count] # User has provided them in order
             logging.info(f"Processing labeled speaker {speaker_label}")
             
 
@@ -128,7 +129,7 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
             conn.commit()
             logging.info(f"Updated {len(id_list)} entries with speaker name {speaker_names[0]}")
         elif len(speaker_names) > 1:
-            print(f"Found multiple speakers: {speaker_names}. This requires a deconflict.")
+            logging.warning(f"Found multiple speakers: {speaker_names}. This requires a deconflict.")
             
         count += 1
 
@@ -240,7 +241,7 @@ def extract_all_samples_per_speaker(run_id):
             # TODO: don't skip; should be able to handle this with mp3s
             logging.info(f"Processing segment of {duration_seconds} seconds.")
             if os.path.getsize(temp_filename) > 20000000:
-                print(f"Skipping segment {start_time}-{end_time} for speaker {speaker_label} because it is too large.")
+                logging.warn(f"Skipping segment {start_time}-{end_time} for speaker {speaker_label} because it is too large.")
                 return
 
             try:
@@ -254,7 +255,7 @@ def extract_all_samples_per_speaker(run_id):
                     time_since_last_request = time.time() - last_request_time
 
                     if time_since_last_request < time_per_request:
-                        logging.warning(f"Rate limiting: waiting {time_per_request - time_since_last_request} seconds.")
+                        logging.info(f"Rate limiting: waiting {time_per_request - time_since_last_request} seconds.")
                         time.sleep(time_per_request - time_since_last_request)
 
                     with open(temp_filename, 'rb') as audio_file:
@@ -423,7 +424,6 @@ def create_schema(DB_PATH):
     conn.commit()
     conn.close()
 
-
 if __name__ == "__main__":
     load_dotenv()
     # TODO: Use https://github.com/asg017/sqlite-vss ?
@@ -445,8 +445,7 @@ if __name__ == "__main__":
     # Create a global cursor
     cursor = conn.cursor()
 
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
-
+    
     openai.api_key = os.getenv("OPENAI_API_KEY")
     # Create an ArgumentParser object
     parser = argparse.ArgumentParser()
@@ -455,11 +454,20 @@ if __name__ == "__main__":
     parser.add_argument('-i', '--input', help='Path to the audio file')
     parser.add_argument('-v', '--verbose', help='Turn on verbose output of ffmpeg and whisper', action='store_true')
     parser.add_argument('-s', '--speakers', help='Comma separated list of speakers in order of appearance', type=str)
+    parser.add_argument('-ll', '--log', help='Set the log level to INFO or DEBUG; is off by default', type=str)
+
+
 
     global args
 
     # Parse the command-line arguments
     args = parser.parse_args()
+
+    if args.log:
+        log_level = logging.DEBUG if args.log == "DEBUG" else logging.INFO
+        logging.basicConfig(level=log_level, format='%(asctime)s | %(levelname)s | %(message)s')
+    else:
+        logging.basicConfig(level=logging.NOTSET, format='%(asctime)s | %(levelname)s | %(message)s')
 
     # Set the input parameters
     audio_path = args.input
