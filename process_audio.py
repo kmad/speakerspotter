@@ -187,7 +187,7 @@ def extract_all_samples_per_speaker(run_id):
     # Define a lock object to synchronize threads
     lock = threading.Lock()
     
-    for speaker_label, segments in tqdm(speakers_segments.items()):
+    for speaker_label, segments in tqdm.tqdm(speakers_segments.items()):
         # Create thread-safe queues for the results
         speakers_text_queue = PriorityQueue()
         speakers_audio_queue = PriorityQueue()
