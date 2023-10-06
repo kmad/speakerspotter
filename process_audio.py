@@ -11,10 +11,11 @@ import chromadb
 import logging
 import whisper
 import sqlite3
+import hashlib
 import random
 import openai
-import hashlib
 import faiss
+import tqdm
 import time
 import json
 import uuid
@@ -143,9 +144,6 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
     return db
     
 def extract_all_samples_per_speaker(run_id):
-    if os.getenv('USE_LOCAL_WHISPER') == "1":
-        logging.info("Using local whisper model.")
-        model = whisper.load_model("base")
 
     INPUT_PATH = f'{run_id}/input.mp3' 
 
@@ -189,7 +187,7 @@ def extract_all_samples_per_speaker(run_id):
     # Define a lock object to synchronize threads
     lock = threading.Lock()
     
-    for speaker_label, segments in speakers_segments.items():
+    for speaker_label, segments in tqdm(speakers_segments.items()):
         # Create thread-safe queues for the results
         speakers_text_queue = PriorityQueue()
         speakers_audio_queue = PriorityQueue()
@@ -208,29 +206,36 @@ def extract_all_samples_per_speaker(run_id):
             duration_seconds = segment_audio.duration_seconds
             # Skip if temp_filename is more than 20MB
             # TODO: don't skip; should be able to handle this with mp3s
-            logging.info(f"Processing segment of {duration_seconds} seconds.")
+            #logging.info(f"Processing segment of {duration_seconds} seconds.")
             if os.path.getsize(temp_filename) > 20000000:
                 logging.warn(f"Skipping segment {start_time}-{end_time} for speaker {speaker_label} because it is too large.")
                 return
 
             try:
                 if os.getenv('USE_LOCAL_WHISPER') == "1":
-                    with lock:
-                        output = model.transcribe(temp_filename, fp16=False, language='English')
+                    logging.info("Using local whisper model.")
+                    model = whisper.load_model("base")
+                    output = model.transcribe(temp_filename, fp16=False, language='English')
                 else:
-                    # Rate limit handling
-                    RATE_LIMIT = 50  # requests per minute
-                    time_per_request = 60.0 / RATE_LIMIT
-                    last_request_time = 0 if 'last_request_time' not in globals() else globals()['last_request_time']
-                    time_since_last_request = time.time() - last_request_time
-
-                    if time_since_last_request < time_per_request:
-                        logging.info(f"Rate limiting: waiting {time_per_request - time_since_last_request} seconds.")
-                        time.sleep(time_per_request - time_since_last_request)
-
                     with open(temp_filename, 'rb') as audio_file:
-                        output = openai.Audio.transcribe("whisper-1", audio_file)
-                        globals()['last_request_time'] = time.time()
+                        output = replicate.run("daanelson/whisperx:9aa6ecadd30610b81119fc1b6807302fd18ca6cbb39b3216f430dcf23618cedd",
+                        input={"audio": audio_file})
+                        output = output[0]
+                        #output = openai.Audio.transcribe("whisper-1", audio_file)
+                    # # Try replicate
+                    # # Rate limit handling
+                    # RATE_LIMIT = 45  # requests per minute
+                    # time_per_request = 60.0 / RATE_LIMIT
+                    # last_request_time = 0 if 'last_request_time' not in globals() else globals()['last_request_time']
+                    # time_since_last_request = time.time() - last_request_time
+
+                    # if time_since_last_request < time_per_request:
+                    #     logging.info(f"Rate limiting: waiting {time_per_request - time_since_last_request} seconds.")
+                    #     time.sleep(time_per_request - time_since_last_request)
+
+                    # with open(temp_filename, 'rb') as audio_file:
+                    #     output = openai.Audio.transcribe("whisper-1", audio_file)
+                    #     globals()['last_request_time'] = time.time()
             except Exception as e:
                 logging.error(f"Error transcribing segment {start_time}-{end_time} for speaker {speaker_label}: {e}")
             
@@ -248,10 +253,11 @@ def extract_all_samples_per_speaker(run_id):
             conn_local.close()
 
              # Add to speaker's transcript
-            with lock:
-                # Using start_time will automatically sort in order
-                speakers_text_queue.put((start_time, (speaker_label, start_time, output['text'] + " ")))
-                speakers_audio_queue.put((start_time, (speaker_label, start_time, segment_audio)))
+            
+            # Using start_time will automatically sort in order
+            # These are thread safe
+            speakers_text_queue.put((start_time, (speaker_label, start_time, output['text'] + " ")))
+            speakers_audio_queue.put((start_time, (speaker_label, start_time, segment_audio)))
 
         # Use a ThreadPoolExecutor to run the process_segment function in parallel for each segment
         
@@ -466,7 +472,7 @@ if __name__ == "__main__":
     audio_path = args.input
     
     try:
-        speaker_list = DefaultList('Unknown', args.speakers.split(','))
+        speaker_list = DefaultList('Unknown', [x.strip() for x in args.speakers.split(',')])
     except:
         speaker_list = DefaultList('Unknown', [])
         
