@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 from pydub import AudioSegment
+from queue import PriorityQueue
 import numpy as np
 import replicate
 import argparse
@@ -54,7 +54,7 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         with open('speaker_map.json', 'r') as f: # TODO: Make configurable
             speaker_map = json.load(f)
     except:
-        logging.warn("First run? Speaker map not found. Creating new speaker map.")
+        logging.warning("First run? Speaker map not found. Creating new speaker map.")
         speaker_map = {}
 
     count = 0
@@ -72,7 +72,7 @@ def insert_speaker_embeddings_to_faiss_db(embeddings, run_id, speaker_list):
         embedding_np = np.asarray(embedding).astype('float32')  # convert the embedding to numpy array
         embedding_np = np.expand_dims(embedding_np, axis=0)  # add an extra dimension for faiss
 
-
+        id_list = []
         if db.ntotal > 0:  # if the database is not empty
             
             # compute the cosine distance between the new embedding and all existing embeddings in the database
@@ -181,9 +181,7 @@ def extract_all_samples_per_speaker(run_id):
     original_audio = AudioSegment.from_mp3(INPUT_PATH)
     
     logging.info("Segmenting audio...")
-    speakers_audio = {}
-    speakers_text = {}
-    
+
 
     from concurrent.futures import ThreadPoolExecutor
     import threading
@@ -192,7 +190,9 @@ def extract_all_samples_per_speaker(run_id):
     lock = threading.Lock()
     
     for speaker_label, segments in speakers_segments.items():
-        
+        # Create thread-safe queues for the results
+        speakers_text_queue = PriorityQueue()
+        speakers_audio_queue = PriorityQueue()
         # Define a function to process each segment
         def process_segment(segment):
             start_time, end_time = segment
@@ -215,7 +215,8 @@ def extract_all_samples_per_speaker(run_id):
 
             try:
                 if os.getenv('USE_LOCAL_WHISPER') == "1":
-                    output = model.transcribe(temp_filename, fp16=False, language='English')
+                    with lock:
+                        output = model.transcribe(temp_filename, fp16=False, language='English')
                 else:
                     # Rate limit handling
                     RATE_LIMIT = 50  # requests per minute
@@ -232,53 +233,58 @@ def extract_all_samples_per_speaker(run_id):
                         globals()['last_request_time'] = time.time()
             except Exception as e:
                 logging.error(f"Error transcribing segment {start_time}-{end_time} for speaker {speaker_label}: {e}")
+            
+            conn_local = sqlite3.connect(DB_PATH)
+            cursor_local = conn_local.cursor()
+   
+            # Add to segments table
+            cursor_local.execute("""
+                INSERT INTO segments (run_id, speaker_id, start_time, end_time, transcript)
+                VALUES (?, ?, ?, ?, ?)
+            """, (run_id, getSpeakerId(run_id, speaker_label), start_time, end_time, output['text']))
+            conn_local.commit()
+            # Perform database operations
+            cursor_local.close()
+            conn_local.close()
 
-                
-            # Add to speaker's transcript
+             # Add to speaker's transcript
             with lock:
-                speaker_id = getSpeakerId(run_id, speaker_label)
-                logging.info("Speaker ID: " + str(speaker_id))
-                if speaker_label not in speakers_text:
-                    speakers_text[speaker_label] = [(start_time, output['text'] + " ")]
-                else:
-                    speakers_text[speaker_label].append((start_time, output['text'] + " "))
-
-                # Add audio segments
-                if speaker_label not in speakers_audio:
-                    speakers_audio[speaker_label] = [(start_time, segment_audio)]
-                else:
-                    speakers_audio[speaker_label].append((start_time, segment_audio))
-                
-                # Add to segments table
-                cursor.execute("""
-                    INSERT INTO segments (run_id, speaker_id, start_time, end_time, transcript)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (run_id, speaker_id, start_time, end_time, output['text']))
-                conn.commit()
+                # Using start_time will automatically sort in order
+                speakers_text_queue.put((start_time, (speaker_label, start_time, output['text'] + " ")))
+                speakers_audio_queue.put((start_time, (speaker_label, start_time, segment_audio)))
 
         # Use a ThreadPoolExecutor to run the process_segment function in parallel for each segment
         
-        # MAX_WORKERS = 4 if os.getenv('USE_LOCAL_WHISPER') == "1" else 8
-        # logging.info(f"Using {MAX_WORKERS} workers to transcribe.")
-        # with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        #     executor.map(process_segment, segments)
-        #     executor.shutdown(wait=True)
+        MAX_WORKERS = 16 if os.getenv('USE_LOCAL_WHISPER') == "1" else 8
+        logging.info(f"Using {MAX_WORKERS} workers to transcribe.")
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            results = list(executor.map(process_segment, segments))
+            executor.shutdown(wait=True)
         
         # This works; above there's an issue with stitching things back together?
-        for segment in segments:
-            process_segment(segment)
+        # for segment in segments:
+        #     process_segment(segment)
 
-     # Sort the audio segments by start_time to ensure they are in order
-    # TODO: Sort in place does this work?
-    for speaker_label in speakers_audio.keys():
-        speakers_audio[speaker_label].sort(key=lambda x: x[0])
-        speakers_audio[speaker_label] = sum([audio for _, audio in speakers_audio[speaker_label]])
+    speakers_audio = {}
+    speakers_text = {}
+    # Rebuild the audio and text for each speaker
+    # These should be in order, so we just distrbute to the right speaker
+    while not speakers_audio_queue.empty():
+        _, (speaker_label, start_time, audio) = speakers_audio_queue.get()
+        if speaker_label not in speakers_audio:
+            speakers_audio[speaker_label] = audio
+        else:
+            speakers_audio[speaker_label] += audio
     
-    chroma_collection = chroma.get_or_create_collection("transcript_embeddings")
-
+    while not speakers_text_queue.empty():
+        _, (speaker_label, start_time, text) = speakers_text_queue.get()
+        if speaker_label not in speakers_text:
+            speakers_text[speaker_label] = [(start_time, text)]
+        else:
+            speakers_text[speaker_label].append((start_time, text))
+    
     for speaker_label, speaker_audio in speakers_audio.items():
         # Sort the transcripts by start_time to ensure they are in order
-        speakers_text[speaker_label].sort(key=lambda x: x[0])
         speakers_text[speaker_label+"_fulltext"] = " ".join([text for _, text in speakers_text[speaker_label]])
         
         # Output transcript
@@ -294,7 +300,10 @@ def extract_all_samples_per_speaker(run_id):
         speaker_audio.export(output_path, format="mp3")
 
         speaker_id = getSpeakerId(run_id, speaker_label)
+
         logging.info("Generating embeddings...")
+        
+        chroma_collection = chroma.get_or_create_collection("transcript_embeddings")
         # Embed and store
         chroma_collection.add(
               ids = [f"{run_id}_{speaker_id}_{start}" for start, _ in speakers_text[speaker_label]]
@@ -310,6 +319,7 @@ def diarize_audio(run_id, audio_path):
     logging.info("Starting diarization...")
 
     # Use replicate as the hosted diarization solution
+
     output_location = replicate.run(
         "lucataco/speaker-diarization:718182bfdc7c91943c69ed0ac18ebe99a76fdde67ccd01fced347d8c3b8c15a6",
         input={"audio": audio_path}
@@ -441,8 +451,6 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--speakers', help='Comma separated list of speakers in order of appearance', type=str)
     parser.add_argument('-ll', '--log', help='Set the log level to INFO or DEBUG; is off by default', type=str)
 
-
-
     global args
 
     # Parse the command-line arguments
@@ -488,8 +496,8 @@ if __name__ == "__main__":
         # Check if the youtube link is already in the runs database
         cursor.execute("SELECT * FROM runs WHERE input_path=?", (original_audio_path,))
         if cursor.fetchone() is not None:
-            logging.error("The youtube link is already in the runs database.")
-            os.exit(1)
+            logging.warning("The youtube link is already in the database.")
+            #exit(1)
 
     r = requests.get(audio_path)
     with open(f"{run_id}/input.mp3", 'wb') as f:
