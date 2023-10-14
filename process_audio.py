@@ -193,6 +193,9 @@ def extract_all_samples_per_speaker(run_id):
         speakers_audio_queue = PriorityQueue()
         # Define a function to process each segment
         def process_segment(segment):
+            if os.getenv('USE_LOCAL_WHISPER') == "1":
+                logging.info("Using local whisper model.")
+                model = whisper.load_model("base")
             start_time, end_time = segment
             segment_audio = original_audio[start_time:end_time]
 
@@ -213,8 +216,6 @@ def extract_all_samples_per_speaker(run_id):
 
             try:
                 if os.getenv('USE_LOCAL_WHISPER') == "1":
-                    logging.info("Using local whisper model.")
-                    model = whisper.load_model("base")
                     output = model.transcribe(temp_filename, fp16=False, language='English')
                 else:
                     with open(temp_filename, 'rb') as audio_file:
