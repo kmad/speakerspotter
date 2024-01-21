@@ -13,10 +13,8 @@ import whisper
 import sqlite3
 import hashlib
 import random
-import openai
 import faiss
 import tqdm
-import time
 import json
 import uuid
 import os
@@ -200,7 +198,6 @@ def extract_all_samples_per_speaker(run_id):
             segment_audio = original_audio[start_time:end_time]
 
             # Generate transcript for segment_audio
-            # Use openai model
             # Generate a random number or other identifier to allow for running in parallel
            
             temp_filename = f"/tmp/temp_audio_{random.randint(1, 100000)}.mp3"
@@ -222,21 +219,7 @@ def extract_all_samples_per_speaker(run_id):
                         output = replicate.run("daanelson/whisperx:9aa6ecadd30610b81119fc1b6807302fd18ca6cbb39b3216f430dcf23618cedd",
                         input={"audio": audio_file})
                         output = output[0]
-                        #output = openai.Audio.transcribe("whisper-1", audio_file)
-                    # # Try replicate
-                    # # Rate limit handling
-                    # RATE_LIMIT = 45  # requests per minute
-                    # time_per_request = 60.0 / RATE_LIMIT
-                    # last_request_time = 0 if 'last_request_time' not in globals() else globals()['last_request_time']
-                    # time_since_last_request = time.time() - last_request_time
 
-                    # if time_since_last_request < time_per_request:
-                    #     logging.info(f"Rate limiting: waiting {time_per_request - time_since_last_request} seconds.")
-                    #     time.sleep(time_per_request - time_since_last_request)
-
-                    # with open(temp_filename, 'rb') as audio_file:
-                    #     output = openai.Audio.transcribe("whisper-1", audio_file)
-                    #     globals()['last_request_time'] = time.time()
             except Exception as e:
                 logging.error(f"Error transcribing segment {start_time}-{end_time} for speaker {speaker_label}: {e}")
             
@@ -448,7 +431,6 @@ if __name__ == "__main__":
     cursor = conn.cursor()
 
     
-    openai.api_key = os.getenv("OPENAI_API_KEY")
     # Create an ArgumentParser object
     parser = argparse.ArgumentParser()
 
@@ -490,7 +472,7 @@ if __name__ == "__main__":
     logging.info("Starting audio processing...")
     
     logging.info("Downloading audio file from URL...")
-    
+    original_audio_path = audio_path
     if "youtube.com" in audio_path:
         
         original_audio_path = audio_path
